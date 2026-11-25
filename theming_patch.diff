@@ -1,33 +1,221 @@
 diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
 --- a/src/adw-style-manager.c
 +++ b/src/adw-style-manager.c
-@@ -465,6 +465,23 @@ notify_high_contrast_cb (AdwStyleManager *self)
+@@ -441,6 +441,211 @@
    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_HIGH_CONTRAST]);
  }
  
-+static void
-+adw_style_manager_theme_changed(GSettings *settings, const char *key, GdkDisplay *display)
-+{
-+  char* theme = g_settings_get_string(settings, "gtk-theme");
-+  char* color_scheme = g_settings_get_string(settings, "color-scheme");
++#define TITLEBUTTON_FIX_KEY "adw-titlebutton-fix-provider"
 +
-+  if(!theme) {
-+    theme = "Adwaita-empty";
++/* Look for the theme's assets directory the same way GTK looks for themes,
++ * and only return it if it contains Breeze-style titlebutton SVGs. */
++static char *
++find_breeze_titlebutton_assets (const char *theme)
++{
++  const char * const *system_dirs = g_get_system_data_dirs ();
++  g_autoptr (GPtrArray) bases = g_ptr_array_new_with_free_func (g_free);
++  guint i;
++
++  if (!theme || !*theme)
++    return NULL;
++
++  g_ptr_array_add (bases, g_build_filename (g_get_user_data_dir (), "themes", NULL));
++  g_ptr_array_add (bases, g_build_filename (g_get_home_dir (), ".themes", NULL));
++  for (i = 0; system_dirs[i]; i++)
++    g_ptr_array_add (bases, g_build_filename (system_dirs[i], "themes", NULL));
++
++  for (i = 0; i < bases->len; i++) {
++    g_autofree char *assets = g_build_filename (g_ptr_array_index (bases, i), theme, "assets", NULL);
++    g_autofree char *probe = g_build_filename (assets, "breeze-close-hover-symbolic.svg", NULL);
++
++    if (g_file_test (probe, G_FILE_TEST_EXISTS))
++      return g_steal_pointer (&assets);
 +  }
 +
-+  gboolean is_dark_variant = NULL != strstr(theme, "-dark") || NULL != strstr(theme, "-Dark") || 0 == strcmp(color_scheme, "prefer-dark");
++  return NULL;
++}
 +
-+  g_object_set(gtk_settings_get_for_display(display),
-+               "gtk-theme-name", theme,
-+               "gtk-application-prefer-dark-theme", is_dark_variant, NULL);
++/* kde-gtk-config renders the KWin decoration buttons into
++ * $XDG_CONFIG_HOME/gtk-{4,3}.0/assets/ using the current KDE colour scheme.
++ * Pull the fill colour of the button circle out of one of those SVGs, so the
++ * hover/pressed close button matches the window decorations (and GTK3 apps
++ * like Firefox) instead of Breeze-gtk's washed-out 50% blend. */
++static char *
++read_kde_decoration_color (const char *asset)
++{
++  static const char * const gtk_dirs[] = { "gtk-4.0", "gtk-3.0" };
++  guint i;
++
++  for (i = 0; i < G_N_ELEMENTS (gtk_dirs); i++) {
++    g_autofree char *path = g_build_filename (g_get_user_config_dir (), gtk_dirs[i],
++                                              "assets", asset, NULL);
++    g_autofree char *contents = NULL;
++    const char *circle, *fill, *end;
++    g_autofree char *color = NULL;
++    GdkRGBA rgba;
++
++    if (!g_file_get_contents (path, &contents, NULL, NULL))
++      continue;
++
++    /* The fill is set on the <g> wrapping the <circle> */
++    circle = strstr (contents, "<circle");
++    if (!circle)
++      continue;
++
++    fill = g_strrstr_len (contents, circle - contents, "fill=\"#");
++    if (!fill)
++      continue;
++
++    fill += strlen ("fill=\"");
++    end = strchr (fill, '"');
++    if (!end || end > circle)
++      continue;
++
++    color = g_strndup (fill, end - fill);
++    if (gdk_rgba_parse (&rgba, color))
++      return g_steal_pointer (&color);
++  }
++
++  return NULL;
++}
++
++static void
++append_titlebutton_rule (GString    *css,
++                         const char *uri,
++                         const char *prefix,
++                         const char *button,
++                         const char *state,
++                         const char *asset,
++                         const char *asset_state,
++                         const char *error_color)
++{
++  g_string_append_printf (css,
++                          "%swindowcontrols button.%s%s {"
++                          " background-image: -gtk-recolor(url(\"%s/breeze-%s%s-symbolic.svg\")%s%s);"
++                          " }\n",
++                          prefix, button, state, uri, asset, asset_state,
++                          error_color ? ", error " : "",
++                          error_color ? error_color : "");
++}
++
++/* Breeze's GTK4 stylesheet draws titlebuttons as 36x36 SVG background images
++ * (scaled down with background-size), and sets the hover variants with
++ * "headerbar windowcontrols button.close:hover" (specificity 0,2,3).
++ * Its own generic "button:hover:not(:checked):not(:active)" (0,3,1) and
++ * "headerbar button:hover:not(:checked):not(:active)" (0,3,2) rules use the
++ * "background" shorthand, which outranks that and resets background-image,
++ * -size and -repeat. The result is that the close/minimize/maximize buttons
++ * vanish (or get tiled at full size) on hover. Re-declare what the theme
++ * intends from a higher-priority provider. */
++static void
++adw_style_manager_update_titlebutton_fix (GdkDisplay *display,
++                                          const char *theme)
++{
++  static const char * const buttons[] = { "close", "minimize", "maximize" };
++  GtkCssProvider *provider = g_object_get_data (G_OBJECT (display), TITLEBUTTON_FIX_KEY);
++  g_autofree char *assets = find_breeze_titlebutton_assets (theme);
++  g_autofree char *uri = NULL;
++  g_autofree char *close_hover = NULL;
++  g_autofree char *close_active = NULL;
++  GString *css;
++  guint i;
++
++  if (!provider) {
++    provider = gtk_css_provider_new ();
++    gtk_style_context_add_provider_for_display (display,
++                                                GTK_STYLE_PROVIDER (provider),
++                                                GTK_STYLE_PROVIDER_PRIORITY_USER);
++    g_object_set_data_full (G_OBJECT (display), TITLEBUTTON_FIX_KEY,
++                            provider, g_object_unref);
++  }
++
++  if (assets)
++    uri = g_filename_to_uri (assets, NULL, NULL);
++
++  if (!uri) {
++    gtk_css_provider_load_from_string (provider, "");
++    return;
++  }
++
++  css = g_string_new ("windowcontrols button.close,"
++                      "windowcontrols button.minimize,"
++                      "windowcontrols button.maximize {"
++                      " border-color: transparent;"
++                      " border-image: none;"
++                      " box-shadow: none;"
++                      " background-color: transparent;"
++                      " background-position: center;"
++                      " background-repeat: no-repeat;"
++                      " background-size: 18px 18px;"
++                      " }\n");
++
++  close_hover = read_kde_decoration_color ("close-hover.svg");
++  close_active = read_kde_decoration_color ("close-active.svg");
++
++  /* Order matters: :active overrides :hover, :backdrop overrides both,
++   * matching the order in the theme. */
++  for (i = 0; i < G_N_ELEMENTS (buttons); i++) {
++    gboolean is_close = g_str_equal (buttons[i], "close");
++
++    /* breeze-close-active is a solid "error"-coloured circle with the X cut
++     * out, i.e. the same shape KWin uses, so recolour it with KDE's colours. */
++    if (is_close && close_hover)
++      append_titlebutton_rule (css, uri, "", "close", ":hover", "close", "-active", close_hover);
++    else
++      append_titlebutton_rule (css, uri, "", buttons[i], ":hover", buttons[i], "-hover", NULL);
++
++    if (is_close && close_active)
++      append_titlebutton_rule (css, uri, "", "close", ":active", "close", "-active", close_active);
++    else
++      append_titlebutton_rule (css, uri, "", buttons[i], ":active", buttons[i], "-active", NULL);
++
++    append_titlebutton_rule (css, uri, "", buttons[i], ":backdrop", buttons[i], "", NULL);
++  }
++
++  /* Higher specificity, so these win over the plain maximize rules. */
++  append_titlebutton_rule (css, uri, ".maximized ", "maximize", ":hover", "maximized", "-hover", NULL);
++  append_titlebutton_rule (css, uri, ".maximized ", "maximize", ":active", "maximized", "-active", NULL);
++  append_titlebutton_rule (css, uri, ".maximized ", "maximize", ":backdrop", "maximized", "", NULL);
++
++  gtk_css_provider_load_from_string (provider, css->str);
++  g_string_free (css, TRUE);
++}
++
++static void
++adw_style_manager_theme_changed (GSettings  *settings,
++                                 const char *key,
++                                 GdkDisplay *display)
++{
++  g_autofree char *theme = g_settings_get_string (settings, "gtk-theme");
++  g_autofree char *color_scheme = g_settings_get_string (settings, "color-scheme");
++  gboolean is_dark_variant;
++
++  if (key && !g_str_equal (key, "gtk-theme") && !g_str_equal (key, "color-scheme"))
++    return;
++
++  if (!theme || !*theme) {
++    g_free (theme);
++    theme = g_strdup ("Adwaita-empty");
++  }
++
++  is_dark_variant = strstr (theme, "-dark") != NULL ||
++                    strstr (theme, "-Dark") != NULL ||
++                    g_strcmp0 (color_scheme, "prefer-dark") == 0;
++
++  g_object_set (gtk_settings_get_for_display (display),
++                "gtk-theme-name", theme,
++                "gtk-application-prefer-dark-theme", is_dark_variant,
++                NULL);
++
++  adw_style_manager_update_titlebutton_fix (display, theme);
 +}
 +
  static void
  adw_style_manager_constructed (GObject *object)
  {
-@@ -471,27 +471,6 @@ adw_style_manager_constructed (GObject *object)
-                              self,
-                              G_CONNECT_SWAPPED);
+@@ -451,27 +656,6 @@
+   if (self->display) {
+     self->gtk_settings = gtk_settings_get_for_display (self->display);
  
 -    if (!adw_is_granite_present () && !g_getenv ("GTK_THEME")) {
 -      g_object_set (self->gtk_settings,
@@ -53,11 +241,10 @@ diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
      self->animations_provider = gtk_css_provider_new ();
      gtk_css_provider_load_from_string (self->animations_provider,
                                         "* { transition: none; }");
-@@ -570,7 +566,18 @@ adw_style_manager_constructed (GObject *object)
-   update_dark (self);
+@@ -530,6 +714,17 @@
    update_fonts (self);
    update_stylesheet (self, UPDATE_ALL);
-+
+ 
 +  if (self->display && !adw_is_granite_present () && !g_getenv ("GTK_THEME")) {
 +    GSettingsSchemaSource *schema_source =
 +      g_settings_schema_source_get_default();
@@ -68,7 +255,7 @@ diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
 +    adw_style_manager_theme_changed(interface_settings, "gtk-theme", self->display);
 +    g_signal_connect (interface_settings, "changed", G_CALLBACK (adw_style_manager_theme_changed), self->display);
 +  }
-
++
    if (self->provider) {
      gtk_css_provider_load_from_resource (self->provider,
                                           "/org/gnome/Adwaita/styles/gtk.css");
