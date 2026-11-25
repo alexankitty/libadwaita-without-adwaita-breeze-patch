@@ -1,7 +1,31 @@
+diff --git a/src/adw-dialog.c b/src/adw-dialog.c
+--- a/src/adw-dialog.c
++++ b/src/adw-dialog.c
+@@ -2095,15 +2095,11 @@
+ 
+   priv = adw_dialog_get_instance_private (self);
+ 
+-  if (parent) {
+-    GtkRoot *root = gtk_widget_get_root (parent);
+-
+-    host = find_dialog_host (parent);
+-
+-    if (GTK_IS_WINDOW (root) && !gtk_window_get_resizable (GTK_WINDOW (root)))
+-      host = NULL;
+-  }
+-
++  /* Always present dialogs as their own (modal, transient) window instead
++   * of as a sheet drawn inside the parent window. The in-window sheet relies
++   * on Adwaita styling (dimming, shadows, rounded sheet) that isn't loaded
++   * here, so with system themes it just looks like a box pasted on top of
++   * the window. */
+   if (host == NULL) {
+     current_host = find_dialog_host (GTK_WIDGET (self));
+ 
 diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
 --- a/src/adw-style-manager.c
 +++ b/src/adw-style-manager.c
-@@ -441,6 +441,211 @@
+@@ -441,6 +441,272 @@
    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_HIGH_CONTRAST]);
  }
  
@@ -149,6 +173,67 @@ diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
 +                      " background-size: 18px 18px;"
 +                      " }\n");
 +
++  /* Breeze gives every list and row the opaque view colour, which turns
++   * .boxed-list (AdwPreferencesGroup, etc.) into black slabs on top of the
++   * translucent window background. Draw them transparent. Activatable rows
++   * keep the theme's own hover/active/selected highlights; rows that can't
++   * be activated (e.g. a row holding a spin button) have no highlight of
++   * their own and would fall back to that opaque colour on hover. */
++  g_string_append (css,
++                   "list.boxed-list,"
++                   "list.boxed-list list,"
++                   "list.boxed-list row:not(.activatable),"
++                   "list.boxed-list row:not(:hover):not(:active):not(:selected) {"
++                   " background-color: transparent;"
++                   " }\n");
++
++  /* Breeze only sizes "headerbar.titlebar" (46px). Libadwaita header bars
++   * aren't titlebars, so their height comes from their contents: one holding
++   * buttons (33px + Breeze's 8px top/bottom margins = 49px) ends up taller
++   * than e.g. a split view's sidebar header holding just a title, and the
++   * two don't line up. Size them all for a standard button. */
++  g_string_append (css,
++                   "headerbar {"
++                   " min-height: 49px;"
++                   " }\n");
++
++  /* Breeze puts those 8px margins on "headerbar button", which for a menu
++   * button is the inner button, so the menubutton itself spans the full
++   * header bar height. Popovers point at the menubutton, so the arrow ended
++   * up at the bottom edge of the header bar rather than under the visible
++   * button. Move the margins to the menubutton. */
++  g_string_append (css,
++                   "headerbar menubutton {"
++                   " margin-top: 8px;"
++                   " margin-bottom: 8px;"
++                   " }\n"
++                   "headerbar menubutton > button {"
++                   " margin-top: 0;"
++                   " margin-bottom: 0;"
++                   " }\n");
++
++  /* Breeze's menu items have a 1px bordered hover highlight, but:
++   * - their padding is in mm (0.75mm 2mm, ~2.83px 7.56px), so GTK lays out
++   *   the content on whole pixels and the border box ends up at fractional
++   *   coordinates, overhanging its parent by ~0.5px on every side and
++   *   blurring the border;
++   * - the first/last items and the sides sit flush against the edge of the
++   *   menu's scrolled window, which clips that overhang (and the border).
++   * Round the padding to whole pixels and move the popover's own padding
++   * inside the scrolled area (keeping the theme's 4px at the sides and
++   * giving 8px at the top and bottom), so the highlight is drawn whole. */
++  g_string_append (css,
++                   "popover modelbutton {"
++                   " padding: 3px 8px;"
++                   " }\n"
++                   "popover.menu > contents {"
++                   " padding-left: 0;"
++                   " padding-right: 0;"
++                   " }\n"
++                   "popover.menu > contents > scrolledwindow > viewport > stack > box {"
++                   " padding: 4px;"
++                   " }\n");
++
 +  close_hover = read_kde_decoration_color ("close-hover.svg");
 +  close_active = read_kde_decoration_color ("close-active.svg");
 +
@@ -213,7 +298,7 @@ diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
  static void
  adw_style_manager_constructed (GObject *object)
  {
-@@ -451,27 +656,6 @@
+@@ -451,27 +717,6 @@
    if (self->display) {
      self->gtk_settings = gtk_settings_get_for_display (self->display);
  
@@ -241,7 +326,7 @@ diff --git a/src/adw-style-manager.c b/src/adw-style-manager.c
      self->animations_provider = gtk_css_provider_new ();
      gtk_css_provider_load_from_string (self->animations_provider,
                                         "* { transition: none; }");
-@@ -530,6 +714,17 @@
+@@ -530,6 +775,17 @@
    update_fonts (self);
    update_stylesheet (self, UPDATE_ALL);
  
